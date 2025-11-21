@@ -40,7 +40,7 @@ def blur_frame(frame, pose_detector):
     for i in head_indices:
         landmark = landmarks[i]
         # Check if the landmark is on-screen and visible
-        if landmark.visibility > 0.3 and 0 <= landmark.x <= 1 and 0 <= landmark.y <= 1:
+        if landmark.visibility > 0.15 and 0 <= landmark.x <= 1 and 0 <= landmark.y <= 1:
             x_coords.append(landmark.x)
             y_coords.append(landmark.y)
 
@@ -80,7 +80,7 @@ def blur_frame(frame, pose_detector):
     face_roi = frame[y:y+h, x:x+w]
     
     # 2. Apply a heavy Gaussian blur
-    blurred_face = cv2.GaussianBlur(face_roi, (99, 99), 30)
+    blurred_face = cv2.GaussianBlur(face_roi, (99, 99), 90)
     
     # 3. Put the blurred face back into the frame
     frame[y:y+h, x:x+w] = blurred_face
@@ -240,8 +240,8 @@ if __name__ == "__main__":
         # --- THIS IS THE CHANGE: Load Pose model, not Face model ---
         mp_pose = mp_face.solutions.pose
         pose_detector = mp_pose.Pose(
-            min_detection_confidence=0.5, 
-            min_tracking_confidence=0.5
+            min_detection_confidence=0.15, 
+            min_tracking_confidence=0.15
         )
         # -----------------------------------------------------------------
         

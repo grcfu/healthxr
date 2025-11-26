@@ -5,28 +5,30 @@ import soundfile as sf
 import numpy as np
 import whisper
 import spacy
-import cv2                # <--- NEW (OpenCV for blurring)
-import mediapipe as mp_face # <--- NEW (MediaPipe for face detection)
+import cv2                
+import mediapipe as mp_face 
 import warnings
 
 # Suppress a specific UserWarning from librosa/soundfile
 warnings.filterwarnings('ignore', message='PySoundFile failed. Trying audioread instead.')
 
-# --- REVISED FUNCTION: Head Blurring (replaces blur_frame) -----------------
+# --- REVISED FUNCTION: Pose Only ---------------------------------
 def blur_frame(frame, pose_detector):
     """
-    Takes a single video frame (NumPy array) and blurs the entire head.
+    Takes a single video frame and blurs the entire head of ONE person.
     """
     frame = frame.copy()
     # Process the frame and find the pose
-    results = pose_detector.process(frame)
+    frame.flags.writeable = False
+    results_pose = pose_detector.process(frame)
+    frame.flags.writeable = True
     
     # If no pose is found, return the original frame
-    if not results.pose_landmarks:
+    if not results_pose.pose_landmarks:
         return frame
 
     # --- We found a pose, now find the head ---
-    landmarks = results.pose_landmarks.landmark
+    landmarks = results_pose.pose_landmarks.landmark
     ih, iw, _ = frame.shape
     
     # We will build a box around key head landmarks
@@ -56,8 +58,8 @@ def blur_frame(frame, pose_detector):
     width_rel = x_max_rel - x_min_rel
     height_rel = y_max_rel - y_min_rel
     
-    width_padding = width_rel * 1.2
-    height_padding = height_rel * 2
+    width_padding = width_rel * 1.0
+    height_padding = height_rel * 1.0
     
     x_min_new = x_min_rel - (width_padding / 2)
     y_min_new = y_min_rel - (height_padding / 2)
@@ -136,6 +138,7 @@ def redact_audio(y, sr, intervals):
         
     return y_redacted
 
+# --- REVISED FUNCTION (Accepts Pose only) ---
 def anonymize_video(input_path, spacy_model, whisper_model, pose_detector, steps=-3):
     """
     Full Pipeline: Extract -> Transcribe -> Find PII -> Redact -> Pitch Shift -> Blur -> Save
@@ -156,20 +159,17 @@ def anonymize_video(input_path, spacy_model, whisper_model, pose_detector, steps
         
         # 2. Extract Audio
         video = mp.VideoFileClip(input_path)
-        # Case 1: Metadata is correct (rotation tag is 90 or 270)
         if video.rotation in (90, 270):
-            print("Detected rotation tag. Resizing to vertical...")
+            print(f"Detected rotation tag ({video.rotation}). Resizing to vertical...")
             video = video.resize(video.size[::-1]) # Swap w/h
             video.rotation = 0 
-        # Case 2: Metadata is missing/wrong
-        elif video.w > video.h and video.rotation in (0, None):
-            print("Detected wide video with no/wrong rotation tag. Forcing vertical resize...")
-            video = video.resize((video.h, video.w))
+        else:
+            print(f"Video is standard {video.w}x{video.h}. No resize needed.")
         video.audio.write_audiofile(temp_audio_path, logger=None)
 
         # 3. HIPAA Step 1: Transcribe (Whisper)
         print("Transcribing audio with Whisper...")
-        whisper_result = whisper_model.transcribe(temp_audio_path, word_timestamps=True, fp16=False)
+        whisper_result = whisper_model.transcribe(temp_audio_path, word_timestamps=True, fp16=False, language='en')
 
         # 4. HIPAA Step 2: Find PII (spaCy)
         mute_times = find_pii_intervals(whisper_result, spacy_model)
@@ -197,7 +197,7 @@ def anonymize_video(input_path, spacy_model, whisper_model, pose_detector, steps
         # 10. Apply Facial Blurring (MediaPipe)
         print("Applying facial blurring (this is the slowest step)...")
         
-        # --- CHANGED: We pass the 'pose_detector' ---
+        # --- CHANGED: We pass Pose only ---
         final_video_blurred = final_video.fl_image(
             lambda frame: blur_frame(frame, pose_detector)
         )
@@ -226,7 +226,7 @@ def anonymize_video(input_path, spacy_model, whisper_model, pose_detector, steps
         if new_audio: new_audio.close()
 
 
-# --- EXECUTION ---
+# --- REVISED EXECUTION (Loads Pose ONLY) ---
 if __name__ == "__main__":
     
     # Load the AI models ONCE when the script starts
@@ -237,12 +237,16 @@ if __name__ == "__main__":
         whisper_model = whisper.load_model("base")
         
         # -----------------------------------------------------------------
-        # --- THIS IS THE CHANGE: Load Pose model, not Face model ---
+        # --- THIS IS THE CHANGE: Load Pose ONLY ---
+        
+        # Load Pose (for profiles/ears, single-person)
         mp_pose = mp_face.solutions.pose
         pose_detector = mp_pose.Pose(
-            min_detection_confidence=0.15, 
-            min_tracking_confidence=0.15
+            static_image_mode=False,
+            min_detection_confidence=0.1, 
+            min_tracking_confidence=0.1
         )
+        # We have removed the FaceMesh detector
         # -----------------------------------------------------------------
         
         print("Models loaded successfully.")
@@ -253,12 +257,12 @@ if __name__ == "__main__":
         print("2. python -m spacy download en_core_web_lg") # Make sure 'lg' is downloaded
         exit()
 
-    video_file = "test2video.MOV" #has to be in same folder as this script
+    video_file = "testvideo4.mov" #has to be in same folder as this script
     
     print(f"Looking for: {video_file}")
     if os.path.exists(video_file):
         # Run the master function, passing in all loaded models
-        # --- CHANGED: Pass 'pose_detector' ---
+        # --- CHANGED: Pass Pose only ---
         anonymize_video(
             video_file, 
             spacy_model=spacy_nlp, 

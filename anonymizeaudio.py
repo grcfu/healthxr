@@ -12,82 +12,79 @@ import warnings
 # Suppress a specific UserWarning from librosa/soundfile
 warnings.filterwarnings('ignore', message='PySoundFile failed. Trying audioread instead.')
 
-# --- REVISED FUNCTION: Pose Only ---------------------------------
-def blur_frame(frame, pose_detector):
+# --- REVISED FUNCTION (FIX 2): Handle read-only frames ---
+def blur_frame(frame, face_detector):
     """
-    Takes a single video frame and blurs the entire head of ONE person.
+    Takes a single video frame (as RGB) and blurs ALL faces found
+    using the MediaPipe FaceDetection model. Handles read-only frames
+    from moviepy.
     """
-    frame = frame.copy()
-    # Process the frame and find the pose
-    frame.flags.writeable = False
-    results_pose = pose_detector.process(frame)
-    frame.flags.writeable = True
     
-    # If no pose is found, return the original frame
-    if not results_pose.pose_landmarks:
-        return frame
+    # 1. Create a writeable copy of the frame immediately.
+    #    The frame from moviepy is read-only, but MediaPipe
+    #    needs a writeable array. .copy() solves this.
+    frame_copy = frame.copy() 
 
-    # --- We found a pose, now find the head ---
-    landmarks = results_pose.pose_landmarks.landmark
-    ih, iw, _ = frame.shape
+    # 2. Process the writeable copy
+    #    (We no longer need to toggle frame.flags.writeable)
+    results_face = face_detector.process(frame_copy)
     
-    # We will build a box around key head landmarks
-    # Indices 0-10 are (Nose, Eyes, Ears, Mouth)
-    head_indices = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    # 3. If no faces, return the ORIGINAL frame (which is untouched)
+    if not results_face.detections:
+        return frame 
 
-    x_coords = []
-    y_coords = []
+    # We will apply blur TO the frame_copy and return it.
+    ih, iw, _ = frame_copy.shape
     
-    # Find all visible head landmarks
-    for i in head_indices:
-        landmark = landmarks[i]
-        # Check if the landmark is on-screen and visible
-        if landmark.visibility > 0.15 and 0 <= landmark.x <= 1 and 0 <= landmark.y <= 1:
-            x_coords.append(landmark.x)
-            y_coords.append(landmark.y)
-
-    # If no head landmarks were visible, return
-    if not x_coords or not y_coords:
-        return frame
-
-    # Find the min/max coordinates to create a bounding box
-    x_min_rel, x_max_rel = min(x_coords), max(x_coords)
-    y_min_rel, y_max_rel = min(y_coords), max(y_coords)
-    
-    # --- Apply padding (like before, but to our new box) ---
-    width_rel = x_max_rel - x_min_rel
-    height_rel = y_max_rel - y_min_rel
-    
-    width_padding = width_rel * 1.0
-    height_padding = height_rel * 1.0
-    
-    x_min_new = x_min_rel - (width_padding / 2)
-    y_min_new = y_min_rel - (height_padding / 2)
-    width_new = width_rel + width_padding
-    height_new = height_rel + height_padding
-    
-    # Convert padded coordinates to pixel values
-    x, y, w, h = int(x_min_new * iw), int(y_min_new * ih), \
-                 int(width_new * iw), int(height_new * ih)
-    # --- End Padding ---
-
-    # Ensure coordinates are valid
-    x, y = max(0, x), max(0, y)
-    w, h = min(iw - x, w), min(ih - y, h)
-
-    # 1. Extract the region of interest (ROI)
-    if w <= 0 or h <= 0:
-        return frame
+    # Loop through all detected faces
+    for detection in results_face.detections:
+        # Get the relative bounding box
+        bbox_rel = detection.location_data.relative_bounding_box
+        if not bbox_rel:
+            continue
             
-    face_roi = frame[y:y+h, x:x+w]
+        x_min_rel = bbox_rel.xmin
+        y_min_rel = bbox_rel.ymin
+        width_rel = bbox_rel.width
+        height_rel = bbox_rel.height
+        
+        # --- Apply padding (Using your original 100% padding logic) ---
+        width_padding = width_rel * .4
+        height_padding = height_rel * .6
+        
+        x_min_new_rel = x_min_rel - (width_padding / 2)
+        y_min_new_rel = y_min_rel - (height_padding / 2)
+        width_new_rel = width_rel + width_padding
+        height_new_rel = height_rel + height_padding
+        
+        # Convert padded coordinates to pixel values
+        x, y, w, h = int(x_min_new_rel * iw), int(y_min_new_rel * ih), \
+                     int(width_new_rel * iw), int(height_new_rel * ih)
+        # --- End Padding ---
+
+        # Ensure coordinates are valid (clamping)
+        x, y = max(0, x), max(0, y)
+        x_end = min(iw, x + w)
+        y_end = min(ih, y + h)
+        
+        # Recalculate w and h based on clamping
+        w = x_end - x
+        h = y_end - y
+
+        # 1. Extract the region of interest (ROI)
+        if w <= 0 or h <= 0:
+            continue # Skip if box is off-screen
+                
+        face_roi = frame_copy[y:y_end, x:x_end] # Get ROI from the copy
+        
+        # 2. Apply a heavy Gaussian blur
+        blurred_face = cv2.GaussianBlur(face_roi, (99, 99), 90)
+        
+        # 3. Put the blurred face back into the copy
+        frame_copy[y:y_end, x:x_end] = blurred_face
     
-    # 2. Apply a heavy Gaussian blur
-    blurred_face = cv2.GaussianBlur(face_roi, (99, 99), 90)
-    
-    # 3. Put the blurred face back into the frame
-    frame[y:y+h, x:x+w] = blurred_face
-    
-    return frame
+    # 4. Return the modified, blurred copy
+    return frame_copy
 # --------------------------------------------------------------------------
 
 def find_pii_intervals(whisper_result, spacy_model):
@@ -138,8 +135,8 @@ def redact_audio(y, sr, intervals):
         
     return y_redacted
 
-# --- REVISED FUNCTION (Accepts Pose only) ---
-def anonymize_video(input_path, spacy_model, whisper_model, pose_detector, steps=-3):
+# --- REVISED FUNCTION (Accepts FaceDetector) ---
+def anonymize_video(input_path, spacy_model, whisper_model, face_detector, steps=-3):
     """
     Full Pipeline: Extract -> Transcribe -> Find PII -> Redact -> Pitch Shift -> Blur -> Save
     """
@@ -197,9 +194,9 @@ def anonymize_video(input_path, spacy_model, whisper_model, pose_detector, steps
         # 10. Apply Facial Blurring (MediaPipe)
         print("Applying facial blurring (this is the slowest step)...")
         
-        # --- CHANGED: We pass Pose only ---
+        # --- CHANGED: We pass FaceDetector ---
         final_video_blurred = final_video.fl_image(
-            lambda frame: blur_frame(frame, pose_detector)
+            lambda frame: blur_frame(frame, face_detector) # Pass face_detector
         )
         # ---
         
@@ -226,7 +223,7 @@ def anonymize_video(input_path, spacy_model, whisper_model, pose_detector, steps
         if new_audio: new_audio.close()
 
 
-# --- REVISED EXECUTION (Loads Pose ONLY) ---
+# --- REVISED EXECUTION (Loads FaceDetection) ---
 if __name__ == "__main__":
     
     # Load the AI models ONCE when the script starts
@@ -237,16 +234,13 @@ if __name__ == "__main__":
         whisper_model = whisper.load_model("base")
         
         # -----------------------------------------------------------------
-        # --- THIS IS THE CHANGE: Load Pose ONLY ---
+        # --- THIS IS THE FIX: Load FaceDetection instead of Pose ---
         
-        # Load Pose (for profiles/ears, single-person)
-        mp_pose = mp_face.solutions.pose
-        pose_detector = mp_pose.Pose(
-            static_image_mode=False,
-            min_detection_confidence=0.1, 
-            min_tracking_confidence=0.1
+        mp_face_detection = mp_face.solutions.face_detection
+        face_detector = mp_face_detection.FaceDetection(
+            min_detection_confidence=0.01  # 0.5 is a good, stable default
         )
-        # We have removed the FaceMesh detector
+        # We have removed the Pose detector as it's not needed for blurring
         # -----------------------------------------------------------------
         
         print("Models loaded successfully.")
@@ -257,17 +251,17 @@ if __name__ == "__main__":
         print("2. python -m spacy download en_core_web_lg") # Make sure 'lg' is downloaded
         exit()
 
-    video_file = "testvideo4.mov" #has to be in same folder as this script
+    video_file = "testvidGDG.MOV" #has to be in same folder as this script
     
     print(f"Looking for: {video_file}")
     if os.path.exists(video_file):
         # Run the master function, passing in all loaded models
-        # --- CHANGED: Pass Pose only ---
+        # --- CHANGED: Pass face_detector ---
         anonymize_video(
             video_file, 
             spacy_model=spacy_nlp, 
             whisper_model=whisper_model, 
-            pose_detector=pose_detector,
+            face_detector=face_detector, # Pass the correct detector
             steps=-3
         )
     else:

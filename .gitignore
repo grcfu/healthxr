@@ -2,3 +2,5 @@
 *.wav
 *.mov
 *.MOVego_blur_face.jit
+yolov8n-face.pt
+temp_*

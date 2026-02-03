@@ -1,268 +1,162 @@
 import os
+import sys
+import time
 import moviepy.editor as mp
 import librosa
 import soundfile as sf
 import numpy as np
 import whisper
 import spacy
-import cv2                
-import mediapipe as mp_face 
+import cv2
+import torch
 import warnings
 
-# Suppress a specific UserWarning from librosa/soundfile
-warnings.filterwarnings('ignore', message='PySoundFile failed. Trying audioread instead.')
+# --- 1. EGOBLUR PATH LINKING ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+paths_to_add = [
+    os.path.join(BASE_DIR, "EgoBlur"),
+    os.path.join(BASE_DIR, "EgoBlur", "egoblur")
+]
+for p in paths_to_add:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
-# --- REVISED FUNCTION (FIX 2): Handle read-only frames ---
-def blur_frame(frame, face_detector):
-    """
-    Takes a single video frame (as RGB) and blurs ALL faces found
-    using the MediaPipe FaceDetection model. Handles read-only frames
-    from moviepy.
-    """
-    
-    # 1. Create a writeable copy of the frame immediately.
-    #    The frame from moviepy is read-only, but MediaPipe
-    #    needs a writeable array. .copy() solves this.
-    frame_copy = frame.copy() 
+try:
+    from egoblur.interface import DetectorIterative
+    print("✅ EgoBlur Engine Linked Successfully.")
+except ImportError as e:
+    print(f"❌ Error linking EgoBlur: {e}")
+    sys.exit()
 
-    # 2. Process the writeable copy
-    #    (We no longer need to toggle frame.flags.writeable)
-    results_face = face_detector.process(frame_copy)
-    
-    # 3. If no faces, return the ORIGINAL frame (which is untouched)
-    if not results_face.detections:
-        return frame 
+warnings.filterwarnings('ignore', message='PySoundFile failed.')
 
-    # We will apply blur TO the frame_copy and return it.
-    ih, iw, _ = frame_copy.shape
+# Global variables for frame skipping
+last_detections = []
+frame_count = 0
+
+def blur_frame_egoblur(frame, detector):
+    global last_detections, frame_count
+    h, w = frame.shape[:2]
     
-    # Loop through all detected faces
-    for detection in results_face.detections:
-        # Get the relative bounding box
-        bbox_rel = detection.location_data.relative_bounding_box
-        if not bbox_rel:
-            continue
+    # --- SPEED: Think every 15 frames (1x per second) ---
+    if frame_count % 15 == 0:
+        scale = 160 / w 
+        small_frame = cv2.resize(frame, (160, int(h * scale)))
+        last_detections = detector.predict(small_frame)
+        last_detections = [[int(c / scale) for c in box] for box in last_detections]
+    
+    frame_count += 1
+    if not last_detections:
+        return frame
+
+    for box in last_detections:
+        x1, y1, x2, y2 = box
+        h_half = int((y2 - y1) / 2)
+        y_end = min(h, y1 + h_half)
+        
+        roi = frame[max(0, y1):y_end, max(0, x1):min(w, x2)]
+        if roi.size > 0:
+            # Fast Box Blur
+            frame[max(0, y1):y_end, max(0, x1):min(w, x2)] = cv2.blur(roi, (51, 51))
             
-        x_min_rel = bbox_rel.xmin
-        y_min_rel = bbox_rel.ymin
-        width_rel = bbox_rel.width
-        height_rel = bbox_rel.height
-        
-        # --- Apply padding (Using your original 100% padding logic) ---
-        width_padding = width_rel * .4
-        height_padding = height_rel * .6
-        
-        x_min_new_rel = x_min_rel - (width_padding / 2)
-        y_min_new_rel = y_min_rel - (height_padding / 2)
-        width_new_rel = width_rel + width_padding
-        height_new_rel = height_rel + height_padding
-        
-        # Convert padded coordinates to pixel values
-        x, y, w, h = int(x_min_new_rel * iw), int(y_min_new_rel * ih), \
-                     int(width_new_rel * iw), int(height_new_rel * ih)
-        # --- End Padding ---
+    return frame
 
-        # Ensure coordinates are valid (clamping)
-        x, y = max(0, x), max(0, y)
-        x_end = min(iw, x + w)
-        y_end = min(ih, y + h)
-        
-        # Recalculate w and h based on clamping
-        w = x_end - x
-        h = y_end - y
-
-        # 1. Extract the region of interest (ROI)
-        if w <= 0 or h <= 0:
-            continue # Skip if box is off-screen
-                
-        face_roi = frame_copy[y:y_end, x:x_end] # Get ROI from the copy
-        
-        # 2. Apply a heavy Gaussian blur
-        blurred_face = cv2.GaussianBlur(face_roi, (99, 99), 90)
-        
-        # 3. Put the blurred face back into the copy
-        frame_copy[y:y_end, x:x_end] = blurred_face
-    
-    # 4. Return the modified, blurred copy
-    return frame_copy
-# --------------------------------------------------------------------------
-
+# --- 3. AI AUDIO PII IDENTIFICATION ---
 def find_pii_intervals(whisper_result, spacy_model):
-    """
-    Analyzes a Whisper transcript with spaCy to find PII
-    and returns a list of time intervals to mute.
-    """
-    full_text = whisper_result['text']
-    print("Analyzing transcript with spaCy NER...")
-    doc = spacy_model(full_text)
-    
+    doc = spacy_model(whisper_result['text'])
     target_labels = {'PERSON', 'ORG', 'GPE', 'LOC', 'DATE', 'TIME'}
+    pii_words = {t.text.lower() for ent in doc.ents if ent.label_ in target_labels for t in ent}
     
-    pii_words = set()
-    for ent in doc.ents:
-        if ent.label_ in target_labels:
-            for token in ent:
-                pii_words.add(token.text.lower())
-                
-    if pii_words:
-        print(f"AI identified these sensitive words to redact: {pii_words}")
-    else:
-        print("AI found no sensitive PII words.")
-
-    mute_intervals = []
+    intervals = []
     for segment in whisper_result['segments']:
         for word_info in segment['words']:
-            clean_word = word_info['word'].strip(" .,!?").lower()
-            if clean_word in pii_words:
-                print(f"Redacting '{clean_word}' at {word_info['start']}s")
-                mute_intervals.append((word_info['start'], word_info['end']))
-                
-    return mute_intervals
+            word_clean = word_info['word'].strip(" .,!?").lower()
+            if word_clean in pii_words:
+                intervals.append((word_info['start'], word_info['end']))
+    return intervals
 
-def redact_audio(y, sr, intervals):
-    """
-    Overwrites specific time intervals in the audio array with silence (0.0).
-    """
-    if not intervals:
-        return y
-        
-    print(f"Redacting {len(intervals)} audio segments...")
-    y_redacted = y.copy()
-    for start_time, end_time in intervals:
-        start_sample = int(start_time * sr)
-        end_sample = int(end_time * sr)
-        y_redacted[start_sample:end_sample] = 0.0
-        
-    return y_redacted
+# --- 4. MASTER PROCESSING PIPELINE ---
+def anonymize_video(input_path, spacy_model, whisper_model, ego_detector):
+    start_time = time.time()
+    name, ext = os.path.splitext(input_path)
+    output_path = f"{name}_anonymized.mp4"
+    temp_a, temp_s = "temp_audio_raw.wav", "temp_audio_mod.wav"
+    temp_v = "temp_no_audio.mp4"
 
-# --- REVISED FUNCTION (Accepts FaceDetector) ---
-def anonymize_video(input_path, spacy_model, whisper_model, face_detector, steps=-3):
-    """
-    Full Pipeline: Extract -> Transcribe -> Find PII -> Redact -> Pitch Shift -> Blur -> Save
-    """
-    # 1. Setup Paths
-    directory, filename = os.path.split(input_path)
-    name, ext = os.path.splitext(filename)
-    temp_audio_path = os.path.join(directory, "temp_audio.wav")
-    temp_shifted_path = os.path.join(directory, "temp_shifted.wav")
-    output_path = os.path.join(directory, f"{name}_anonymized{ext}")
-
-    print(f"Processing: {filename}...")
-    video = None
-    new_audio = None
-    
     try:
-        # --- AUDIO PIPELINE ---
+        # Step A: Audio Processing
+        print("🎙️ Processing Audio (Whisper + Pitch Shift)...")
+        video_clip = mp.VideoFileClip(input_path)
+        video_clip.audio.write_audiofile(temp_a, fps=16000, logger=None)
         
-        # 2. Extract Audio
-        video = mp.VideoFileClip(input_path)
-        if video.rotation in (90, 270):
-            print(f"Detected rotation tag ({video.rotation}). Resizing to vertical...")
-            video = video.resize(video.size[::-1]) # Swap w/h
-            video.rotation = 0 
-        else:
-            print(f"Video is standard {video.w}x{video.h}. No resize needed.")
-        video.audio.write_audiofile(temp_audio_path, logger=None)
-
-        # 3. HIPAA Step 1: Transcribe (Whisper)
-        print("Transcribing audio with Whisper...")
-        whisper_result = whisper_model.transcribe(temp_audio_path, word_timestamps=True, fp16=False, language='en')
-
-        # 4. HIPAA Step 2: Find PII (spaCy)
-        mute_times = find_pii_intervals(whisper_result, spacy_model)
-
-        # 5. Load Audio for Processing
-        y, sr = librosa.load(temp_audio_path, sr=None) 
-
-        # 6. Apply Redaction (Silence the PII)
-        y = redact_audio(y, sr, mute_times)
-
-        # 7. Apply Pitch Shift (Anonymize Voice)
-        print("Applying pitch shift...")
-        y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=steps)
-
-        # 8. Save Anonymized Audio
-        print("Saving new audio...")
-        sf.write(temp_shifted_path, y_shifted, sr)
-        new_audio = mp.AudioFileClip(temp_shifted_path)
+        res = whisper_model.transcribe(temp_a, word_timestamps=True, fp16=False)
+        mute_times = find_pii_intervals(res, spacy_model)
         
-        # --- VIDEO PIPELINE ---
+        y, sr = librosa.load(temp_a, sr=16000)
+        for s, e in mute_times:
+            y[int(s*sr):int(e*sr)] = 0.0
+        y_shift = librosa.effects.pitch_shift(y, sr=sr, n_steps=-3)
+        sf.write(temp_s, y_shift, sr)
 
-        # 9. Set the new audio to the original video clip
-        final_video = video.set_audio(new_audio)
+        # Step B: Fast Video Loop (OpenCV)
+        print("🎬 Processing Video via OpenCV (Turbo Mode)...")
+        cap = cv2.VideoCapture(input_path)
+        orig_fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        # 10. Apply Facial Blurring (MediaPipe)
-        print("Applying facial blurring (this is the slowest step)...")
+        # Target: 640p at 15fps
+        target_w = 640
+        target_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) * (target_w / cap.get(cv2.CAP_PROP_FRAME_WIDTH)))
         
-        # --- CHANGED: We pass FaceDetector ---
-        final_video_blurred = final_video.fl_image(
-            lambda frame: blur_frame(frame, face_detector) # Pass face_detector
-        )
-        # ---
-        
-        # 11. Write the final, combined file
-        print("Stitching final video file...")
-        final_video_blurred.write_videofile(
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(temp_v, fourcc, 15, (target_w, target_h))
+
+        frame_idx = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret: break
+            
+            # Process every 2nd frame to drop FPS to ~15
+            if frame_idx % 2 == 0:
+                frame = cv2.resize(frame, (target_w, target_h))
+                blurred_frame = blur_frame_egoblur(frame, ego_detector)
+                out.write(blurred_frame)
+            
+            frame_idx += 1
+            if frame_idx % 50 == 0:
+                print(f"  > Processed {frame_idx}/{total_frames} frames...")
+
+        cap.release()
+        out.release()
+
+        # Step C: Final Merge
+        print("💾 Merging Result...")
+        final_v = mp.VideoFileClip(temp_v)
+        final_a = mp.AudioFileClip(temp_s)
+        final_v.set_audio(final_a).write_videofile(
             output_path, 
             codec='libx264', 
-            audio_codec='aac', 
-            logger=None, 
-            bitrate='10M'
+            preset='ultrafast', 
+            logger=None
         )
 
-        print(f"Success! Saved to: {output_path}")
+        print(f"\n✅ Pipeline Complete in {time.time() - start_time:.2f}s")
 
     except Exception as e:
-        print(f"Error processing video: {e}")
-
+        print(f"❌ Pipeline Error: {e}")
     finally:
-        # 12. Cleanup
-        if os.path.exists(temp_audio_path): os.remove(temp_audio_path)
-        if os.path.exists(temp_shifted_path): os.remove(temp_shifted_path)
-        if video: video.close()
-        if new_audio: new_audio.close()
+        for f in [temp_a, temp_s, temp_v]:
+            if os.path.exists(f): os.remove(f)
 
-
-# --- REVISED EXECUTION (Loads FaceDetection) ---
 if __name__ == "__main__":
+    print("🚀 Initializing AI Models...")
+    nlp = spacy.load("en_core_web_lg")
+    whisper_ai = whisper.load_model("base")
+    dev = "mps" if torch.backends.mps.is_available() else "cpu"
+    detector = DetectorIterative(model_path="ego_blur_face.jit", device=dev)
     
-    # Load the AI models ONCE when the script starts
-    print("Loading all AI models into memory...")
-    try:
-        # --- USE THE 'lg' MODEL FOR BEST PII DETECTION ---
-        spacy_nlp = spacy.load("en_core_web_lg")
-        whisper_model = whisper.load_model("base")
-        
-        # -----------------------------------------------------------------
-        # --- THIS IS THE FIX: Load FaceDetection instead of Pose ---
-        
-        mp_face_detection = mp_face.solutions.face_detection
-        face_detector = mp_face_detection.FaceDetection(
-            min_detection_confidence=0.01  # 0.5 is a good, stable default
-        )
-        # We have removed the Pose detector as it's not needed for blurring
-        # -----------------------------------------------------------------
-        
-        print("Models loaded successfully.")
-    except Exception as e:
-        print(f"Error loading AI models: {e}")
-        print("Please ensure you have run:")
-        print("1. python -m pip install spacy openai-whisper opencv-python mediapipe")
-        print("2. python -m spacy download en_core_web_lg") # Make sure 'lg' is downloaded
-        exit()
-
-    video_file = "testvidGDG.MOV" #has to be in same folder as this script
-    
-    print(f"Looking for: {video_file}")
-    if os.path.exists(video_file):
-        # Run the master function, passing in all loaded models
-        # --- CHANGED: Pass face_detector ---
-        anonymize_video(
-            video_file, 
-            spacy_model=spacy_nlp, 
-            whisper_model=whisper_model, 
-            face_detector=face_detector, # Pass the correct detector
-            steps=-3
-        )
+    target_video = "testshortsimul.mp4"
+    if os.path.exists(target_video):
+        anonymize_video(target_video, nlp, whisper_ai, detector)
     else:
-        print(f"Could not find '{video_file}'. Make sure it is in the same folder as this script.")
+        print(f"❌ Error: {target_video} not found.")

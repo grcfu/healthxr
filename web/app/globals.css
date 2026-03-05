@@ -1,26 +1,39 @@
 @import "tailwindcss";
 
+/* 1. CUSTOM THEME VARIABLES */
+@theme {
+  --color-enamel: #0ea5e9;
+  --color-radiology: #0f172a;
+  --color-electric: #22d3ee;
+  --color-mint: #10b981;
+  
+  /* Adding the glass-panel as a custom utility */
+  --shadow-glass: 0 8px 32px 0 rgba(14, 165, 233, 0.1);
+}
+
+/* 2. THE GLASSMORPHISM UTILITY */
+@utility glass-panel {
+  background-color: rgba(255, 255, 255, 0.4);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  box-shadow: var(--shadow-glass);
+}
+
+/* 3. BASE STYLES */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --background: #f8fafc;
+  --foreground: #0f172a;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-geist-sans), Arial, sans-serif;
+  overflow-x: hidden;
+}
+
+/* Smooth Scrolling for the Mission & Strategy sections */
+html {
+  scroll-behavior: smooth;
 }

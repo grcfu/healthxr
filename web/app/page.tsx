@@ -172,11 +172,23 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="relative flex justify-center">
-             <div className="w-64 h-64 rounded-[3rem] glass-panel flex items-center justify-center relative overflow-hidden group border-enamel/30">
-                <User className="w-32 h-32 text-slate-200 group-hover:text-enamel transition-colors" />
-                <div className="absolute bottom-4 left-0 w-full text-center text-[10px] font-black uppercase tracking-widest text-enamel">Founder // CEO</div>
-             </div>
+          <div className="relative flex justify-center group">
+            {/* This adds the glowing border that activates on hover */}
+            <div className="absolute -inset-2 rounded-[3.5rem] bg-gradient-to-r from-enamel via-electric to-mint opacity-0 group-hover:opacity-100 blur-lg transition-opacity duration-500 z-0" />
+            
+            <div className="w-64 h-64 rounded-[3rem] glass-panel flex items-center justify-center relative overflow-hidden group border-white/10 z-10">
+              {/* 📸 PLACE YOUR IMAGE ADDRESS BELOW */}
+              <img 
+                src="https://www.sihf.org/media-library/profile-photos/804-1741212682.jpg" 
+                alt="Dr. Aaron DeForest" 
+                className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
+              />
+              
+              {/* Subtle text overlay at the bottom of the photo */}
+              <div className="absolute bottom-0 left-0 w-full text-center bg-radiology/80 backdrop-blur-sm py-3">
+                <div className="text-[10px] font-black uppercase tracking-widest text-enamel">Founder // CEO</div>
+              </div>
+            </div>
           </div>
 
           <div className="space-y-8 text-right">

@@ -299,7 +299,6 @@ export default function Home() {
             <div className="space-y-8">
               <h5 className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-300">Ecosystem</h5>
               <ul className="space-y-4 font-bold text-slate-500">
-                <li className="hover:text-enamel transition-colors">Arch Grants</li>
                 <li className="hover:text-enamel transition-colors">Washington University</li>
                 <li className="hover:text-enamel transition-colors">Skandalaris Center</li>
               </ul>
